@@ -17,93 +17,50 @@
   This program was inspired by the
   [Awesome Pulseaudio Widget (APW)](https://github.com/mokasin/apw)
 ]]
-local string = string
-
-local awful = require("awful")
-local gears = require("gears")
-
-local wibox = require("wibox")
+local awful   = require("awful")
+local gears   = require("gears")
+local wibox   = require("wibox")
 local naughty = require("naughty")
 
-local pulse = require("pulseaudio_dbus")
+local pulse   = require("pulseaudio_dbus")
 
-local lgi = require('lgi')
-local icon_theme = lgi.Gtk.IconTheme.get_default()
-local IconLookupFlags = lgi.Gtk.IconLookupFlags
-
-local icon_size = 64
-local icon_flags = {IconLookupFlags.GENERIC_FALLBACK}
-
-local function lookup_icon(name)
-  return icon_theme:lookup_icon(name, icon_size, icon_flags)
-end
-
-local function load_icon(icon)
-  if icon ~= nil then
-    return icon:load_surface()
-  end
-end
-
-local icon = {
-  high = lookup_icon("audio-volume-high-symbolic"),
-  med = lookup_icon("audio-volume-medium-symbolic"),
-  low = lookup_icon("audio-volume-low-symbolic"),
-  muted = lookup_icon("audio-volume-muted-symbolic"),
+local widget = {}
+widget.widget = wibox.widget {
+  {
+    id = 'sink',
+    widget = wibox.widget.textbox
+  },
+  {
+    id = 'source',
+    widget = wibox.widget.textbox
+  },
+  spacing = 5,
+  layout = wibox.layout.fixed.horizontal
 }
 
-local widget = wibox.widget {
-  resize = true,
-  widget = wibox.widget.imagebox
-}
+awful.tooltip { text = "pulse(sink)"  , objects = { widget.widget.sink   } }
+awful.tooltip { text = "pulse(source)", objects = { widget.widget.source } }
 
-widget.tooltip = awful.tooltip({ objects = { widget },})
-
-function widget:update_appearance(v)
-  local i, msg
-
-  if v == "Muted" then
-    msg = v
-    i = load_icon(icon.muted)
-  else
-    v = v == "Unmuted" and self.sink:get_volume_percent()[1] or tonumber(v)
-    msg = string.format("%d%%", v)
-    if v <= 33 then
-      i = load_icon(icon.low)
-    elseif v <= 66 then
-      i = load_icon(icon.med)
-    else
-      i = load_icon(icon.high)
-    end
-  end
-
-  self.image = i
-  self.tooltip:set_text(msg)
-
+function widget:refresh(device)
+    local color = self[device]:is_muted() and 'dimgray' or 'darkgray'
+    self.widget[device].markup = string.format("<span foreground='%s'>%d</span>", color, self[device]:get_volume_percent()[1])
 end
 
 function widget:notify(v)
   local msg = tonumber(v) and string.format("%d%%", v) or v
-
   if self.notification then
     naughty.destroy(self.notification, naughty.notificationClosedReason.dismissedByCommand)
   end
-
-  self.notification = naughty.notify(
-    {
-      text=msg,
-      timeout=self.notification_timeout_seconds
-    }
-  )
-
+  self.notification = naughty.notify({text=msg, timeout=self.notify_timeout_sec})
 end
 
 function widget:update_sink(object_path)
-  self.sink = pulse.get_device(self.connection, object_path)
+  self.sink = pulse.get_device(self.connection, object_path, 5, 100)
 end
 
 function widget:update_sources(sources)
   for _, source_path in ipairs(sources) do
-    local s = pulse.get_device(self.connection, source_path)
+    local s = pulse.get_device(self.connection, source_path, 5, 100)
     if s.Name and not s.Name:match("%.monitor$") then
       self.source = s
       break
@@ -113,45 +70,34 @@ function widget:update_sources(sources)
   end
 end
 
-function widget.volume_up()
-  if not widget.sink:is_muted() then
-    widget.sink:volume_up()
+function widget.volume_up(device)
+  if widget[device] then
+    widget[device]:volume_up()
   end
 end
 
-function widget.volume_down()
-  if not widget.sink:is_muted() then
-    widget.sink:volume_down()
+function widget.volume_down(device)
+  if widget[device] then
+    widget[device]:volume_down()
   end
 end
 
-function widget.toggle_muted()
-  widget.sink:toggle_muted()
-end
-
-function widget.volume_up_mic()
-  if widget.source and not widget.source:is_muted() then
-    widget.source:volume_up()
+function widget.toggle_muted(device)
+  if widget[device] then
+    widget[device]:toggle_muted()
   end
 end
 
-function widget.volume_down_mic()
-  if widget.source and not widget.source:is_muted() then
-    widget.source:volume_down()
-  end
+for _,device in pairs({'sink', 'source'}) do
+  widget.widget[device]:buttons(
+    gears.table.join(
+      awful.button({ }, 1, function() widget.toggle_muted(device) end),
+      awful.button({ }, 3, function() awful.spawn(widget.mixer)   end),
+      awful.button({ }, 4, function() widget.volume_up(device)    end),
+      awful.button({ }, 5, function() widget.volume_down(device)  end)
+    )
+  )
 end
-
-function widget.toggle_muted_mic()
-  if widget.source then
-    widget.source:toggle_muted()
-  end
-end
-
-widget:buttons(gears.table.join(
-                 awful.button({ }, 1, widget.toggle_muted),
-                 awful.button({ }, 3, function () awful.spawn(widget.mixer) end),
-                 awful.button({ }, 4, widget.volume_up),
-                 awful.button({ }, 5, widget.volume_down)))
 
 function widget:connect_device(device)
   if not device then
@@ -162,10 +108,11 @@ function widget:connect_device(device)
     device:connect_signal(
       function (this, volume)
         -- FIXME: BaseVolume for sources (i.e. microphones) won't give the correct percentage
-        local v = math.ceil(tonumber(volume[1]) / this.BaseVolume * 100)
+        -- local v = math.ceil(tonumber(volume[1]) / this.BaseVolume * 100)
         if this.object_path == self.sink.object_path then
-          self:update_appearance(v)
-          self:notify(v)
+          self:refresh('sink')
+        elseif self.source and this.object_path == self.source.object_path then
+          self:refresh('source')
         end
       end,
       "VolumeUpdated"
@@ -175,10 +122,10 @@ function widget:connect_device(device)
   if device.signals.MuteUpdated then
     device:connect_signal(
       function (this, is_mute)
-        local m = is_mute and "Muted" or "Unmuted"
         if this.object_path == self.sink.object_path then
-          self:update_appearance(m)
-          self:notify(m)
+          self:refresh('sink')
+        elseif self.source and this.object_path == self.source.object_path then
+          self:refresh('source')
         end
       end,
       "MuteUpdated"
@@ -189,14 +136,18 @@ end
 function widget:init()
   local status, address = pcall(pulse.get_address)
   if not status then
-    naughty.notify({title="Error while loading the PulseAudio widget",
-                    text=address,
-                    preset=naughty.config.presets.critical})
+    naughty.notify(
+      {
+        title="Error while loading the PulseAudio widget",
+        text=address,
+        preset=naughty.config.presets.critical
+      }
+    )
     return self
   end
 
   self.mixer = "pavucontrol"
-  self.notification_timeout_seconds = 1
+  self.notify_timeout_sec = 5
 
   self.connection = pulse.get_connection(address)
   self.core = pulse.get_core(self.connection)
@@ -210,8 +161,7 @@ function widget:init()
     function (_, newsink)
       self:update_sink(newsink)
       self:connect_device(self.sink)
-      local volume = self.sink:is_muted() and "Muted" or self.sink:get_volume_percent()[1]
-      self:update_appearance(volume)
+      self:refresh('sink')
     end,
     "NewSink"
   )
@@ -221,19 +171,19 @@ function widget:init()
     function (_, newsource)
       self:update_sources({newsource})
       self:connect_device(self.source)
+      self:refresh('source')
     end,
     "NewSource"
   )
 
   self:update_sources(self.core:get_sources())
   self:connect_device(self.source)
+  self:refresh('source')
 
   local sink_path = assert(self.core:get_sinks()[1], "No sinks found")
   self:update_sink(sink_path)
   self:connect_device(self.sink)
-
-  local volume = self.sink:is_muted() and "Muted" or self.sink:get_volume_percent()[1]
-  self:update_appearance(volume)
+  self:refresh('sink')
 
   self.__index = self
 
@@ -241,3 +191,4 @@ function widget:init()
 end
 
 return widget:init()
+
